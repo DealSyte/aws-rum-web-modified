@@ -49,14 +49,9 @@ describe('RRWebPlugin', () => {
         jest.useRealTimers();
     });
 
-    test('uses RRWEB_CONFIG_PROD defaults with enforced privacy', () => {
+    test('uses RRWEB_CONFIG_PROD by default', () => {
         const p = new RRWebPlugin();
-        expect(p['config'].recordOptions).toMatchObject({
-            ...RRWEB_CONFIG_PROD.recordOptions,
-            maskAllInputs: true,
-            maskTextSelector: '*',
-            maskInputOptions: undefined
-        });
+        expect(p['config']).toEqual(RRWEB_CONFIG_PROD);
     });
 
     test('RRWEB_CONFIG_PROD has expected values', () => {
@@ -69,12 +64,14 @@ describe('RRWebPlugin', () => {
                 inlineStylesheet: true,
                 inlineImages: false,
                 collectFonts: true,
-                recordCrossOriginIframes: false
+                recordCrossOriginIframes: false,
+                maskAllInputs: true,
+                maskTextSelector: '*'
             }
         });
     });
 
-    test('enforces privacy masking even when customer tries to override', () => {
+    test('allows customer to override privacy masking', () => {
         const p = new RRWebPlugin({
             recordOptions: {
                 maskAllInputs: false,
@@ -82,9 +79,9 @@ describe('RRWebPlugin', () => {
                 maskInputOptions: {}
             } as any
         });
-        expect(p['config'].recordOptions.maskAllInputs).toBe(true);
-        expect(p['config'].recordOptions.maskTextSelector).toBe('*');
-        expect(p['config'].recordOptions.maskInputOptions).toBeUndefined();
+        expect(p['config'].recordOptions.maskAllInputs).toBe(false);
+        expect(p['config'].recordOptions.maskTextSelector).toBeUndefined();
+        expect(p['config'].recordOptions.maskInputOptions).toEqual({});
     });
 
     test('merges custom config with defaults', () => {
