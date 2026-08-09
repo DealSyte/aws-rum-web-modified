@@ -1,0 +1,214 @@
+name: Publish Fork to CodeArtifact
+
+# Publishes the three workspace packages to the Finalis CodeArtifact
+# `internal` repository under their ORIGINAL upstream names
+# (`aws-rum-web`, `@aws-rum/web-core`, `@aws-rum/web-slim`) with a
+# fork-specific version. See `docs/fork-maintenance.md` for the rationale and
+# for how consumers point npm at the registry.
+#
+# This is additive to the fork: upstream's own `cd.yaml` (CDN + public npm)
+# is left untouched. It is `workflow_dispatch`-only and depends on AWS
+# secrets we do not hold, so it cannot fire here by accident — leaving it
+# alone keeps `git merge upstream/main` conflict-free.
+
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: 'Version to publish. Defaults to <lerna.json version>-finalis.<run number>.'
+                required: false
+                type: string
+            dry_run:
+                description: 'Build and pack, but do not publish.'
+                required: false
+                type: boolean
+                default: false
+
+# id-token: write is required for the GitHub OIDC handshake that lets us
+# assume the publish role without storing any AWS credentials in the repo.
+permissions:
+    id-token: write
+    contents: read
+
+concurrency:
+    group: publish-codeartifact
+    cancel-in-progress: false
+
+env:
+    AWS_REGION: us-east-1
+    # Finalis Teams account. Not a secret — it appears in every CodeArtifact
+    # registry URL — and hardcoding it keeps this workflow runnable without
+    # any repo-variable setup. Mirrors `pipelineAccount` in
+    # finalis-atlas/packages/cdk-infrastructure/src/pipeline/pipeline-config.yaml.
+    AWS_ACCOUNT_ID: '260282789507'
+    CODEARTIFACT_DOMAIN: finalis
+    CODEARTIFACT_REPOSITORY: internal
+    # Created by `FinalisCodeArtifact` in finalis-atlas. Trusts only this
+    # repository's main branch and tags.
+    PUBLISH_ROLE_NAME: finalis-codeartifact-publish
+
+jobs:
+    publish:
+        name: Build and Publish
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout fork
+              uses: actions/checkout@v5
+
+            - name: Setup Node
+              uses: actions/setup-node@v5
+              with:
+                  node-version: '20.x'
+
+            - name: Cache NPM modules
+              uses: actions/cache@v5
+              with:
+                  path: ~/.npm
+                  key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+                  restore-keys: |
+                      ${{ runner.os }}-node-
+
+            # Install from PUBLIC npm, before the CodeArtifact login below.
+            # Two reasons: the build no longer depends on the registry being
+            # reachable or warm, and `npm ci` must run BEFORE the version
+            # stamp — afterwards the workspace dependency ranges no longer
+            # match package-lock.json and `npm ci` would refuse to run.
+            - name: Install dependencies
+              run: |
+                  npm install -g npm@^11
+                  npm ci
+
+            - name: Resolve version
+              id: version
+              run: |
+                  BASE=$(node -p "require('./lerna.json').version")
+                  VERSION="${{ inputs.version }}"
+                  if [ -z "$VERSION" ]; then
+                    VERSION="${BASE}-finalis.${{ github.run_number }}"
+                  fi
+                  echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+                  echo "Publishing version $VERSION (upstream base $BASE)"
+
+            - name: Run unit tests
+              run: npm test
+
+            # Stamp AFTER install and tests, BEFORE build. Upstream pins the
+            # intra-monorepo dependencies exactly, so this also rewrites
+            # `packages/web` -> `@aws-rum/web-core` etc. to the fork version;
+            # otherwise consumers would resolve the PUBLIC 3.x core at install
+            # time and silently run a mix of forked and unforked code.
+            - name: Stamp fork version
+              run: node scripts/set-fork-version.mjs "${{ steps.version.outputs.version }}"
+
+            - name: Build
+              run: npm run build
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@v5
+              with:
+                  role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/${{ env.PUBLISH_ROLE_NAME }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            # Writes the CodeArtifact registry + a 12-hour bearer token into
+            # the runner's ~/.npmrc. Everything after this point talks to
+            # CodeArtifact rather than npmjs.
+            - name: Authenticate npm to CodeArtifact
+              run: |
+                  aws codeartifact login \
+                    --tool npm \
+                    --domain "$CODEARTIFACT_DOMAIN" \
+                    --domain-owner "$AWS_ACCOUNT_ID" \
+                    --repository "$CODEARTIFACT_REPOSITORY" \
+                    --region "$AWS_REGION"
+
+            - name: Pack (dry run)
+              if: ${{ inputs.dry_run }}
+              run: |
+                  for pkg in core slim web; do
+                    ( cd "packages/$pkg" && npm pack --dry-run )
+                  done
+                  echo "Dry run: nothing published."
+
+            # Publishes in dependency order: core, then slim (depends on
+            # core), then web (depends on both).
+            #
+            # The origin-configuration calls around each publish are the
+            # important part. All three of these package names ALSO exist on
+            # public npm, and our `internal` repository has npmjs as an
+            # upstream, so CodeArtifact's package origin controls apply:
+            #
+            #   - if a package first enters the repo via a publish, it gets
+            #     publish=ALLOW, upstream=BLOCK;
+            #   - if it first enters via an upstream fetch (someone ran
+            #     `npm install aws-rum-web` through this registry), it gets
+            #     publish=BLOCK and our publish fails with AccessDenied.
+            #
+            # Setting the restriction BEFORE publish repairs that second
+            # case, and setting it AFTER publish makes the shadowing explicit
+            # and permanent instead of dependent on whoever got there first.
+            # The pre-publish call is expected to fail with
+            # ResourceNotFoundException the very first time (package not in
+            # the repo yet), which is why it tolerates failure.
+            - name: Publish to CodeArtifact
+              if: ${{ !inputs.dry_run }}
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: |
+                  set -euo pipefail
+
+                  set_origin() {
+                    local namespace_args=()
+                    if [ -n "$2" ]; then namespace_args=(--namespace "$2"); fi
+                    aws codeartifact put-package-origin-configuration \
+                      --domain "$CODEARTIFACT_DOMAIN" \
+                      --domain-owner "$AWS_ACCOUNT_ID" \
+                      --repository "$CODEARTIFACT_REPOSITORY" \
+                      --region "$AWS_REGION" \
+                      --format npm "${namespace_args[@]}" --package "$1" \
+                      --restrictions publish=ALLOW,upstream=BLOCK \
+                      --output text > /dev/null
+                  }
+
+                  # workspace-dir : package-name : npm-namespace (empty if unscoped)
+                  for entry in "core:web-core:aws-rum" "slim:web-slim:aws-rum" "web:aws-rum-web:"; do
+                    dir="${entry%%:*}"
+                    rest="${entry#*:}"
+                    name="${rest%%:*}"
+                    namespace="${rest#*:}"
+
+                    if [ -n "$namespace" ]; then full="@${namespace}/${name}"; else full="$name"; fi
+                    echo "::group::Publishing ${full}@${VERSION}"
+
+                    # Tolerated: fails with ResourceNotFoundException until
+                    # the package exists in the repository.
+                    set_origin "$name" "$namespace" || \
+                      echo "No existing origin configuration for ${full} (expected on first publish)."
+
+                    ( cd "packages/$dir" && npm publish --access public )
+
+                    # Now guaranteed to exist: lock in publish=ALLOW,
+                    # upstream=BLOCK so our fork deterministically shadows the
+                    # public package inside this repository.
+                    set_origin "$name" "$namespace"
+
+                    echo "::endgroup::"
+                  done
+
+            - name: Summary
+              run: |
+                  {
+                    echo "### CodeArtifact publish"
+                    echo
+                    echo "| Field | Value |"
+                    echo "| --- | --- |"
+                    echo "| Version | \`${{ steps.version.outputs.version }}\` |"
+                    echo "| Dry run | \`${{ inputs.dry_run }}\` |"
+                    echo "| Repository | \`${CODEARTIFACT_DOMAIN}/${CODEARTIFACT_REPOSITORY}\` |"
+                    echo "| Registry | \`https://${CODEARTIFACT_DOMAIN}-${AWS_ACCOUNT_ID}.d.codeartifact.${AWS_REGION}.amazonaws.com/npm/${CODEARTIFACT_REPOSITORY}/\` |"
+                    echo
+                    echo "Install with:"
+                    echo
+                    echo '```'
+                    echo "npm install aws-rum-web@${{ steps.version.outputs.version }}"
+                    echo '```'
+                  } >> "$GITHUB_STEP_SUMMARY"
