@@ -184,7 +184,11 @@ jobs:
                     set_origin "$name" "$namespace" || \
                       echo "No existing origin configuration for ${full} (expected on first publish)."
 
-                    ( cd "packages/$dir" && npm publish --access public )
+                    if npm view "$full@$VERSION" version > /dev/null 2>&1; then
+                      echo "$full@$VERSION already published, skipping"
+                    else
+                      ( cd "packages/$dir" && npm publish --access public )
+                    fi
 
                     # Now guaranteed to exist: lock in publish=ALLOW,
                     # upstream=BLOCK so our fork deterministically shadows the
